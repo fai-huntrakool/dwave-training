@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Dec 22 23:36:45 2019
+
+@author: phuntrakaool
+"""
+from pyqubo import Array
+import numpy as np
+import neal
+import itertools
+from dwave.system import EmbeddingComposite, DWaveSampler
+from collections import defaultdict
+import matplotlib.pyplot as plt
+from scipy.optimize import dual_annealing
+
+def transform_x2spin(x):
+    return np.array([2 * i - 1 for i in x])
+
+
+def create_random_dataset(size, num_covs):
+    np.random.seed(seed = 400)
+    return np.random.random((size, num_covs)) * 10
+
+
+def create_bins_array(initial_mat, num_bins, n_cov):
+    b_mat = np.zeros((len(initial_mat), len(initial_mat[0])))
+    bins = np.linspace(0, 10, num_bins)
+    for b in range(n_cov):
+        data = initial_mat[:, b]
+        digitized = np.digitize(data, bins)
+        b_mat[:, b] = digitized
+    return b_mat
+
+
+def coefficient_adjustment():
+    return round((np.random.random(1)-0.5)[0]/20,2)
+
+
+def problem_formulation(size, b_mat, num_bins):
+    S = np.append(Array.create('s', shape=size, vartype='SPIN'), [1])
+    numerator, divisor = [], []
+    p = 0
+    for col in range(len(b_mat[0])):
+        for b in range(1, num_bins):
+            nume, div = [], []
+            for val in b_mat[:, col]:
+                if val == b:    
+                    coeff = coefficient_adjustment()
+                    nume.append(1.0 + coeff)
+                    coeff = coefficient_adjustment()
+                    div.append(-1.0 - coeff)
+                else:
+                    nume.append(0)
+                    div.append(0)
+                p+=1
+            nume.append(0)
+            div.append((sum(div) * -1.0) + 1)
+            #div.append((sum(div) * -1.0) + 0.01)
+            numerator.append(nume)
+            divisor.append(div)
+    return S, numerator, divisor
+
+
+def qa_solver(bqm, previous_solution, num_reads=100):
+    sampler = EmbeddingComposite(DWaveSampler())
+    response = sampler.sample(bqm, num_reads=num_reads)
+    min_ener = float('Inf')
+    for sample, energy in response.data(['sample', 'energy']):
+        if min_ener >= energy**2:
+            current_solution = sample
+            size = len(previous_solution)
+            solution = []
+            alphabet = list(current_solution.keys())[0][0]
+            for i in range(size - 1):
+                key = alphabet+'[{}]'.format(i)
+                solution.append(current_solution[key])
+            current_solution = np.append(np.array(solution), [1])
+            min_ener = energy**2
+    return current_solution,response
+
+def sa_solver(bqm, previous_solution, num_reads=100):
+    sampler = neal.SimulatedAnnealingSampler()
+    response = sampler.sample(bqm, num_reads=num_reads)
+    
+    min_ener = float('Inf')
+    
+    for sample, energy in response.data(['sample', 'energy']):
+        if min_ener >= energy**2:
+            current_solution = sample
+            size = len(previous_solution)
+            solution = []
+            alphabet = list(current_solution.keys())[0][0]
+            for i in range(size - 1):
+                key = alphabet+'[{}]'.format(i)
+                solution.append(current_solution[key])
+            current_solution = np.append(np.array(solution), [1])
+            min_ener = energy**2
+    return current_solution, response
+
+
+def objective_value2(x, numerator, divisor, lamb):
+    # obj_1 = num/den
+    # obj_2 = num - lamb*den
+    num = np.dot(numerator, x)**2
+    den = np.dot(divisor, x)
+    den_with_lamb = lamb * den
+
+
+    sub_obj_1 = [num[i] / den[i] if den[i] != 0 else float('Inf') for i in range(len(num))]
+    obj_1 = np.sum(sub_obj_1)
+
+    # sub_obj_2 = [(num[i] - den_with_lamb[i])**2 for i in range(len(num))]
+    sub_obj_2 = [(num[i] - den_with_lamb[i]) for i in range(len(num))]
+    obj_2 = np.sum(sub_obj_2)
+    return obj_1, sub_obj_1, obj_2, sub_obj_2, num, den
+
+
+def exact_solver(numerator, divisor, size, num_terms, is_spin = 0):
+    if is_spin == 1:
+        binary = [-1,1]
+    else:
+        binary = [0,1]
+    min_value, objective_solution = float('Inf'), []
+    comb = [np.append(np.array(i), [1]) for i in itertools.product(binary, repeat=size)]
+    keep = 0
+    save = defaultdict(int)
+    for i in range(len(comb)):
+        obj_1, sub, _, _, n, d = objective_value2(comb[i], numerator, divisor, np.array([1]*num_terms))
+        if min_value > obj_1:
+            min_value = obj_1
+            objective_solution = comb[i]
+            keep = sub
+            set_objective_solution = []
+        if obj_1 == min_value:
+            set_objective_solution.append(comb[i])
+        save[obj_1] += 1
+            
+    return min_value, objective_solution, keep, set_objective_solution, save
+
+def generate_test_problem(size, num_covs, num_bins):
+    num_terms = (num_bins-1) * num_covs
+    df = create_random_dataset(size, num_covs)
+    b_mat = create_bins_array(df, num_bins, num_covs)
+    x, numerator, divisor = problem_formulation(size, b_mat, num_bins)
+    return x, numerator, divisor, num_terms
+
+def generate_test_case(size, num_terms, var_type="BINARY"):
+    x = np.append(Array.create('x', size, var_type), [1])
+    numerator, divisor = [], []
+    for i in range(num_terms):
+        numerator.append(np.random.randint(1, 10, size + 1))
+        divisor.append(np.random.randint(1, 10, size + 1))
+    print(numerator)
+    print(divisor)
+    return x, numerator, divisor
+
+def objective_value(x, numerator, divisor, lamb, p, y_i, z):
+    num = np.dot(numerator, x)**2
+    den = np.dot(divisor, x)
+    t_1 = np.dot(y_i,(x - z))
+    t_2 = p/2*np.sum([(x_i - z_i)**2 for x_i, z_i in zip(x,z)])
+    mod_num = num + den*(t_1 + t_2)
+    obj_1 = mod_num/den
+    obj_2 = mod_num - lamb*den 
+    return obj_1, obj_2
+
+def generate_bqm(x, numerator, divisor, lamb, p, y_i, z):     
+    num = np.dot(numerator, x)**2
+    den = np.dot(divisor, x)
+    t_1 = np.dot(y_i,(x - z))
+    t_2 = p/2*np.sum([(x_i - z_i)**2 for x_i, z_i in zip(x,z)])
+    feed_obj_fun = (num + den*(t_1 + t_2) - lamb*den)[0] 
+    model = feed_obj_fun.compile()
+    bqm = model.to_dimod_bqm()
+    return bqm
+
+def print_iteration_value(i, current_solution, obj_1, obj_2, lamb):
+    print('term: {}'.format(i))
+    print('solution: {}'.format(current_solution[:-1]))
+    print('min P(x)-a*Q(X) = {}.'.format(obj_2))
+    print('fix lambda={} : min P(x)/Q(X) = {}.'.format(lamb, obj_1))
+
+def dinkelbach_for_one_ratio(x, lamb, numerator, divisor, p, y_i, z,n, i=1):
+    bqm = generate_bqm(x, numerator, divisor, lamb, p, y_i, z)
+    current_solution, res = sa_solver(bqm, x)
+    current_solution = transform_x2spin(current_solution)
+    obj_1, obj_2 = objective_value(current_solution, numerator, divisor, lamb, p, y_i, z)
+    #print_iteration_value(i, current_solution, obj_1, obj_2, lamb)
+    #print('--------------------------------------------')
+    if abs(obj_2) > 0.000000001:
+        lamb = np.array(obj_1)
+        return dinkelbach_for_one_ratio(x, lamb, numerator, divisor, p, y_i, z,n, i + 1)
+    else:
+        print_iteration_value(n, current_solution, obj_1, obj_2, lamb)
+        return current_solution, obj_1, obj_2
+
+
+def find_min_xi(x, numerator, divisor, lamb):
+    x_i = []
+    n=1
+    for num, div, l,y in zip(numerator, divisor, lamb, y_i):
+        solution, _, _ = dinkelbach_for_one_ratio(x, [l],[num], [div], p, y, z,n, i=1)
+        x_i.append(solution)
+        print('-------------------next term--------------------------')
+        n+=1
+    return x_i
+
+
+def update_z(z, x_i, p, y_i):
+    mat_x = np.array(x_i)
+    avg_x_i = mat_x.mean(0)
+
+    mat_y = np.array(y_i)
+    avg_y_i = mat_y.mean(0)
+    new_z = avg_x_i + 1 / p * avg_y_i
+    return new_z, np.linalg.norm(new_z-z)
+
+
+def update_y(x_i, y_i, z, p):
+    return np.array([y + p * (x - z) for y, x in zip(y_i,x_i)])
+
+def stopping_condition(x_i, z):
+    diff_xz = np.average([np.linalg.norm(x-z) for x in x_i])
+    return diff_xz
+    
+
+def ADMM(x, numerator, divisor, lamb, p, y_i, z):       
+    n = 0
+    collect = []
+    diff_z, diff_xz = float('inf'), float('inf')
+    while (abs(diff_z)>0.000001) | (abs(diff_xz)>0.000001):
+        print('****************:next iter: ',n,' ***************:')
+        x_i= find_min_xi(x, numerator, divisor, lamb)
+        z, diff_z = update_z(z, x_i, p, y_i)
+        y_i = update_y(x_i, y_i, z, p)
+        diff_xz = stopping_condition(x_i, z)
+        n+=1
+        collect.append(z)
+        print(diff_z, diff_xz)
+        
+    obj_z, _,_,_,_,_ = objective_value2(z, numerator, divisor, lamb)
+    
+    round_func = lambda x: int(round(x))
+    
+    print('z: ', list(map(round_func,z)))
+    print('obj_z: ', obj_z)
+    return obj_z
+
+#initialize 
+size = 8
+num_covs = 2
+num_bins = 3 #mean n-1 bins
+
+x, numerator, divisor, terms = generate_test_problem(size, num_covs, num_bins)
+
+
+ans = []
+solution = []
+for m in range(10):
+    y_i = np.zeros((terms,(size+1)))
+    lamb = np.array([10.0]*terms)
+    z = np.array([0.0]*(size+1))
+    p = 1
+
+    n = 0
+    collect = []
+    diff_z, diff_xz = float('inf'), float('inf')
+    while (abs(diff_z)>0.000001) | (abs(diff_xz)>0.000001):
+        print('****************:next iter: ',n,' ***************:')
+        x_i= find_min_xi(x, numerator, divisor, lamb)
+        z, diff_z = update_z(z, x_i, p, y_i)
+        y_i = update_y(x_i, y_i, z, p)
+        diff_xz = stopping_condition(x_i, z)
+        n+=1
+        collect.append(z)
+        
+    obj_z, _,_,_,_,_ = objective_value2(z, numerator, divisor, lamb)
+    round_func = lambda x: int(round(x))
+    
+    #print('z: ', list(map(round_func,z)))
+    #print('obj_z: ', obj_z)
+    ans.append(obj_z)
+    solution.append(list(map(round_func,z)))
+
+if size < 15:
+    obj, sol, _, set_objective_solution, all_solv = exact_solver(numerator, divisor, size, terms, is_spin = 1)
+    
+    print('Exact solver: ',sol)
+    print('Exact obj: ', obj)
+    print('no. of solutions: ',len(set_objective_solution))
+    
+print('-------------')
+########### Direct Simulated Annealing
+def modify(x):
+    x = np.where(x<0, -1, 1)
+    return np.append(x,1)
+
+def func(numerator, divisor, terms):
+    func2d = lambda x: np.sum([(np.dot(modify(x), numerator[i]))**2/np.dot(modify(x), divisor[i]) for i in range(terms)])
+    return func2d
+
+func2d = func(numerator, divisor, terms)
+lw = [-1] * size
+up = [1] * size
+ret = dual_annealing(func2d, bounds=list(zip(lw, up)), seed=1234)
+print("Simulated Annealing: {0}".format(modify(ret.x)))
+print('Simulated Annealing obj: {0}'.format(ret.fun))
+
+#print(*set_objective_solution, sep = '\n')
+print('-------------')
+#print('ADMM - list of z in each iteration:')
+#print(*collect, sep = "\n") 
+
+sorted_obj = list(all_solv.keys())
+sorted_obj.sort()
+
+print('ADMM - Ranking of z solution')
+print('Best obj :', min(ans))
+print('z = ',solution[ans.index(min(ans))])   
+print('----------------')
+    
+ans.sort()
+print('Lowest/Highest Ranking of z solution')
+print('Best Rank : ', sorted_obj.index(ans[0]) + 1,'/',len(sorted_obj))    
+print('Worst Rank : ', sorted_obj.index(ans[-1]) + 1,'/',len(sorted_obj)) 
+print('All obj value from n iteration = ',ans)
+
+
+plt.style.use('seaborn')
+y = [round((i+1)/len(sorted_obj),2) for i in range(len(sorted_obj))]
+
+plt.subplot(2, 1, 1)
+plt.plot(sorted_obj, y)
+plt.scatter([ans[0]], [(sorted_obj.index(ans[0]) + 1)/len(sorted_obj)], color = 'r')
+plt.scatter([ans[-1]], [(sorted_obj.index(ans[-1]) + 1)/len(sorted_obj)], color = 'r')
+plt.yticks(np.arange(0, 1.1, step=0.1))
+plt.show()
+    
+    
+plt.subplot(2, 1, 2)
+plt.plot(sorted_obj, y)
+plt.scatter([ans[0]], [(sorted_obj.index(ans[0]) + 1)/len(sorted_obj)], color = 'r')
+plt.scatter([ans[-1]], [(sorted_obj.index(ans[-1]) + 1)/len(sorted_obj)], color = 'r')
+plt.xlim(sorted_obj[0]-0.2,sorted_obj[sorted_obj.index(ans[-1]) + 1]+1)
+plt.yticks(np.arange(0, 1.1, step=0.1))
+plt.show()
+    
+
+#plt.subplot(2, 1, 1)
+#plt.bar(all_solv.keys(), all_solv.values(), 1 , color='g')
+#plt.bar([ans[0],ans[-1]], [all_solv[ans[0]], all_solv[ans[1]]], 1 , color='r')
+#plt.title('Distribution of exact solutions and obj_z')
+#plt.show()
+#
+#
+#plt.subplot(2, 1, 2)
+#plt.bar(all_solv.keys(), all_solv.values(), 0.1 , color='g')
+#plt.bar([ans[0],ans[-1]], [all_solv[ans[0]], all_solv[ans[1]]], 0.1 , color='r')
+#plt.xlim(sorted_obj[0]-0.2,ans[-1]+0.2)
+#plt.title('Distribution of exact solutions and obj_z')
+#plt.show()
+
